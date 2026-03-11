@@ -1,0 +1,17 @@
+# Rotobot Dependencies
+# Most are already in the parent LabyrinthGameSandbox .venv.
+# This file is here for documentation / standalone setup.
+
+torch>=2.0
+numpy
+Pillow
+opencv-python
+tqdm
+PyQt6
+
+# GroundingDINO and SAM2 are loaded from the parent project's models/ directory.
+# They do not need pip install — they are used via local imports.
+# See ../models/groundingdino/ and ../models/sam2/repo/
+
+# FFmpeg must be on PATH for video output (WebM VP9+alpha encoding).
+# Download from https://ffmpeg.org/download.html

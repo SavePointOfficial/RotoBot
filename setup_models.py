@@ -12,9 +12,9 @@ def download_file(url, dest_path):
     except Exception as e:
         print(f"Error downloading {url}: {e}")
 
-def run_command(cmd, cwd=None):
+def run_command(cmd, cwd=None, env=None):
     print(f"Running: {cmd}")
-    subprocess.run(cmd, shell=True, cwd=cwd, check=True)
+    subprocess.run(cmd, shell=True, cwd=cwd, env=env, check=True)
 
 def main():
     root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +40,10 @@ def main():
         print("GroundingDINO is already installed.")
     except ImportError:
         print("Installing GroundingDINO from github...")
-        run_command("pip install git+https://github.com/IDEA-Research/GroundingDINO.git")
+        # Disable CUDA extension build (requires MSVC) and force use of existing torch
+        env = os.environ.copy()
+        env["GROUNDINGDINO_BUILD_CUDA_EXT"] = "0"
+        run_command("pip install --no-build-isolation git+https://github.com/IDEA-Research/GroundingDINO.git", env=env)
 
     # 2. SAM2
     sam2_dir = os.path.join(models_dir, "sam2")
@@ -55,7 +58,9 @@ def main():
     if not os.path.exists(sam2_repo_dir):
         print("Installing SAM2 from github...")
         run_command(f"git clone https://github.com/facebookresearch/sam2.git {sam2_repo_dir}")
-        run_command("pip install -e .", cwd=sam2_repo_dir)
+        env = os.environ.copy()
+        env["SAM2_BUILD_CUDA"] = "0"
+        run_command("pip install --no-build-isolation -e .", cwd=sam2_repo_dir, env=env)
 
     # 3. RealESRGAN
     resrgan_weights_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"

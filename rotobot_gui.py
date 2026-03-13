@@ -21,13 +21,17 @@ SANDBOX_ROOT = os.path.dirname(ROTOBOT_DIR)
 if ROTOBOT_DIR not in sys.path:
     sys.path.insert(0, ROTOBOT_DIR)
 
+# IMPORTANT: Import torch BEFORE PyQt6. On Windows, PyQt6 modifies the DLL
+# search path which prevents torch's CUDA libraries (c10.dll etc.) from loading.
+import torch
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QProgressBar, QFileDialog,
     QTextEdit, QSplitter, QFrame, QComboBox, QCheckBox, QGroupBox,
     QScrollArea, QSizePolicy, QColorDialog, QSpinBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData, QSettings
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData, QSettings, QTimer
 from PyQt6.QtGui import (
     QPixmap, QImage, QFont, QColor, QPalette, QDragEnterEvent,
     QDropEvent, QPainter,
@@ -303,6 +307,384 @@ class InventoryWorker(QThread):
 
 
 # ============================================================================
+# Media Preview Widget  (3-mode display + fullscreen expand)
+# ============================================================================
+
+# Display modes
+PREVIEW_ORIGINAL   = 0
+PREVIEW_ALPHA      = 1
+PREVIEW_SIDE       = 2
+_MODE_ICONS  = ["🖼️", "🎭", "⬛⬜"]
+_MODE_TIPS   = ["Original Image", "Alpha Result (checkerboard)", "Side-by-Side"]
+
+
+class MediaPreviewWidget(QFrame):
+    """Shows the current input media with 3 display modes and fullscreen."""
+    next_clicked = pyqtSignal()
+    fullscreen_requested = pyqtSignal()   # ask main window for overlay
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("""
+            MediaPreviewWidget {
+                background: #0d0d1a;
+                border: 2px solid #333;
+                border-radius: 12px;
+            }
+        """)
+
+        # State ---------------------------------------------------------
+        self._current_media = None     # file path
+        self._original_pixmap = None   # QPixmap of original image
+        self._alpha_array = None       # np.ndarray (H,W) uint8, or None
+        self._display_mode = PREVIEW_ORIGINAL
+
+        # Video playback state
+        self._cap = None
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._update_frame)
+
+        # Layout --------------------------------------------------------
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Top-right icon bar (absolutely positioned via a top row)
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(8, 8, 8, 0)
+        top_bar.addStretch()
+
+        icon_col = QVBoxLayout()
+        icon_col.setSpacing(4)
+
+        _ICON_SS = """
+            QPushButton {
+                background: rgba(30,30,55,200);
+                border: 1px solid #555;
+                border-radius: 5px;
+                padding: 2px 5px;
+                color: #ddd;
+                font-size: 15px;
+            }
+            QPushButton:hover {
+                background: rgba(0,170,255,150);
+                border-color: #00d4ff;
+            }
+        """
+
+        self._mode_btn = QPushButton(_MODE_ICONS[0])
+        self._mode_btn.setFixedSize(36, 30)
+        self._mode_btn.setToolTip("Display: Original Image")
+        self._mode_btn.setStyleSheet(_ICON_SS)
+        self._mode_btn.clicked.connect(self._cycle_mode)
+        icon_col.addWidget(self._mode_btn)
+
+        self._fs_btn = QPushButton("🔍")
+        self._fs_btn.setFixedSize(36, 30)
+        self._fs_btn.setToolTip("Fullscreen preview")
+        self._fs_btn.setStyleSheet(_ICON_SS)
+        self._fs_btn.clicked.connect(self.fullscreen_requested.emit)
+        icon_col.addWidget(self._fs_btn)
+
+        icon_col.addStretch()
+        top_bar.addLayout(icon_col)
+        root.addLayout(top_bar)
+
+        # Central image label
+        self._label = QLabel("No Input")
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setStyleSheet("color: #666; font-size: 16px; border: none;")
+        root.addWidget(self._label, stretch=1)
+
+        # Bottom-right "Next" button (calibration mode only)
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setContentsMargins(10, 0, 10, 10)
+        bottom_bar.addStretch()
+
+        self._next_btn = QPushButton("Next ⏭")
+        self._next_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self._next_btn.setStyleSheet("""
+            QPushButton {
+                background: #0088cc;
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 5px 15px;
+                color: #fff;
+            }
+            QPushButton:hover { background: #00aaff; }
+        """)
+        self._next_btn.clicked.connect(self.next_clicked.emit)
+        self._next_btn.setVisible(False)
+        bottom_bar.addWidget(self._next_btn)
+        root.addLayout(bottom_bar)
+
+    # -- public API ----------------------------------------------------
+
+    def set_calibration_mode(self, enabled: bool):
+        self._next_btn.setVisible(enabled)
+
+    def load_media(self, path: str):
+        """Load a new file into the preview (resets alpha result)."""
+        self._stop_video()
+        self._current_media = path
+        self._original_pixmap = None
+        self._alpha_array = None
+        self._display_mode = PREVIEW_ORIGINAL
+        self._mode_btn.setText(_MODE_ICONS[0])
+        self._mode_btn.setToolTip("Display: " + _MODE_TIPS[0])
+
+        if not path:
+            self._label.clear()
+            self._label.setText("No Input")
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext in VIDEO_EXTS:
+            self._play_video(path)
+        else:
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                self._original_pixmap = pixmap
+                self._refresh_display()
+            else:
+                self._label.setText("Error loading image")
+
+    def set_alpha_result(self, image_path: str, alpha: np.ndarray):
+        """Store a finished alpha for the given image and refresh."""
+        try:
+            # Only accept if it matches the currently loaded file
+            if self._current_media and os.path.normpath(image_path) == os.path.normpath(self._current_media):
+                self._alpha_array = alpha
+                # Auto-switch to alpha view when a result arrives
+                self._display_mode = PREVIEW_ALPHA
+                self._mode_btn.setText(_MODE_ICONS[PREVIEW_ALPHA])
+                self._mode_btn.setToolTip("Display: " + _MODE_TIPS[PREVIEW_ALPHA])
+                self._refresh_display()
+        except Exception as e:
+            log.error("Error in set_alpha_result: %s", e, exc_info=True)
+
+    def get_current_pixmap(self) -> QPixmap:
+        """Return the pixmap currently shown (used for fullscreen)."""
+        pm = self._label.pixmap()
+        return pm if pm and not pm.isNull() else QPixmap()
+
+    # -- display helpers -----------------------------------------------
+
+    def _cycle_mode(self):
+        self._display_mode = (self._display_mode + 1) % 3
+        self._mode_btn.setText(_MODE_ICONS[self._display_mode])
+        self._mode_btn.setToolTip("Display: " + _MODE_TIPS[self._display_mode])
+        self._refresh_display()
+
+    def _refresh_display(self):
+        """Re-render the label based on the current display mode."""
+        if self._cap is not None:
+            # Video is playing — video frames are pushed by timer; nothing else to do
+            return
+
+        w = max(self.width() - 20, 50)
+        h = max(self.height() - 60, 50)   # leave room for icon bar / next btn
+
+        if self._display_mode == PREVIEW_ORIGINAL:
+            self._render_original(w, h)
+        elif self._display_mode == PREVIEW_ALPHA:
+            self._render_alpha(w, h)
+        else:
+            self._render_side_by_side(w, h)
+
+    def _render_original(self, max_w, max_h):
+        if not self._original_pixmap or self._original_pixmap.isNull():
+            self._label.setText("No image loaded")
+            return
+        scaled = self._original_pixmap.scaled(
+            max_w, max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self._label.setPixmap(scaled)
+
+    def _render_alpha(self, max_w, max_h):
+        if self._alpha_array is None:
+            # Fall back to original if no result yet
+            self._render_original(max_w, max_h)
+            return
+        alpha_pm = self._build_alpha_pixmap(max_w, max_h)
+        self._label.setPixmap(alpha_pm)
+
+    def _render_side_by_side(self, max_w, max_h):
+        if self._original_pixmap is None or self._original_pixmap.isNull():
+            self._label.setText("No image loaded")
+            return
+        if self._alpha_array is None:
+            self._render_original(max_w, max_h)
+            return
+
+        half_w = (max_w - 10) // 2
+        orig_scaled = self._original_pixmap.scaled(
+            half_w, max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        alpha_pm = self._build_alpha_pixmap(half_w, max_h)
+
+        # Combine into one pixmap
+        total_w = orig_scaled.width() + 10 + alpha_pm.width()
+        canvas_h = max(orig_scaled.height(), alpha_pm.height())
+        canvas = QPixmap(total_w, canvas_h)
+        canvas.fill(QColor(13, 13, 26))
+        painter = QPainter(canvas)
+        painter.drawPixmap(0, 0, orig_scaled)
+        painter.drawPixmap(orig_scaled.width() + 10, 0, alpha_pm)
+        painter.end()
+        self._label.setPixmap(canvas)
+
+    def _build_alpha_pixmap(self, max_w, max_h) -> QPixmap:
+        """Composite image * alpha over a checkerboard, return QPixmap."""
+        from PIL import Image
+
+        if self._original_pixmap is None or self._alpha_array is None:
+            return QPixmap()
+
+        # Convert original QPixmap to numpy, accounting for QImage row padding.
+        # QImage pads each row to a 4-byte boundary, so sizeInBytes may be
+        # larger than height*width*3.  We reshape with bytesPerLine as stride.
+        qimg_orig = self._original_pixmap.toImage().convertToFormat(
+            QImage.Format.Format_RGB888)
+        ptr = qimg_orig.bits()
+        ptr.setsize(qimg_orig.sizeInBytes())
+        bpl = qimg_orig.bytesPerLine()
+        img_raw = np.frombuffer(ptr, dtype=np.uint8).reshape(
+            qimg_orig.height(), bpl)
+        img_array = img_raw[:, :qimg_orig.width() * 3].reshape(
+            qimg_orig.height(), qimg_orig.width(), 3).copy()
+
+        h, w = img_array.shape[:2]
+        alpha = self._alpha_array
+        ah, aw = alpha.shape[:2]
+        if (ah, aw) != (h, w):
+            import cv2
+            alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        scale = min(max_w / w, max_h / h, 1.0)
+        pw = max(int(w * scale), 1)
+        ph = max(int(h * scale), 1)
+
+        pil_img = Image.fromarray(img_array)
+
+        # Build RGBA
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[:, :, :3] = img_array
+        rgba[:, :, 3] = alpha
+        rgba_img = Image.fromarray(rgba, 'RGBA').resize((pw, ph), Image.LANCZOS)
+
+        # Checkerboard
+        checker = _make_checker(pw, ph, 8)
+        bg = Image.fromarray(checker).convert('RGBA')
+        bg.paste(rgba_img, (0, 0), rgba_img)
+        result = bg.convert('RGB')
+
+        arr = np.array(result)
+        qimg = QImage(arr.data, pw, ph, pw * 3, QImage.Format.Format_RGB888)
+        # CRITICAL: must .copy() — arr.data is a buffer reference that becomes
+        # invalid once arr is garbage collected, causing a segfault/crash.
+        return QPixmap.fromImage(qimg.copy())
+
+    # -- video ---------------------------------------------------------
+
+    def _play_video(self, path: str):
+        import cv2
+        self._cap = cv2.VideoCapture(path)
+        if not self._cap.isOpened():
+            self._label.setText("Error opening video")
+            return
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0: fps = 30.0
+        self._update_frame()
+        self._timer.start(int(1000.0 / fps))
+
+    def _update_frame(self):
+        if not self._cap: return
+        ret, frame = self._cap.read()
+        if not ret:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._cap.read()
+            if not ret: return
+        import cv2
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        qimg = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+        scaled = pixmap.scaled(
+            self.width() - 20, self.height() - 60,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation)
+        self._label.setPixmap(scaled)
+
+    def _stop_video(self):
+        self._timer.stop()
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+
+    # -- resize --------------------------------------------------------
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._current_media and self._cap is None:
+            self._refresh_display()
+
+    def closeEvent(self, event):
+        self._stop_video()
+        super().closeEvent(event)
+
+
+def _make_checker(w: int, h: int, size: int = 8) -> np.ndarray:
+    """Vectorised checkerboard for alpha visualization."""
+    ys = np.arange(h) // size
+    xs = np.arange(w) // size
+    grid = (ys[:, None] + xs[None, :]) % 2   # 0 or 1
+    checker = np.where(grid[:, :, None] == 0, 180, 220).astype(np.uint8)
+    return np.broadcast_to(checker, (h, w, 3)).copy()
+
+
+# ============================================================================
+# Fullscreen Overlay  (click anywhere to dismiss)
+# ============================================================================
+
+class FullscreenOverlay(QWidget):
+    """Covers the entire main window with the current preview pixmap."""
+    dismissed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: #0a0a14;")
+        self._pixmap = QPixmap()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hide()
+
+    def show_pixmap(self, pixmap: QPixmap):
+        self._pixmap = pixmap
+        self.raise_()
+        self.show()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(10, 10, 20))
+        if self._pixmap and not self._pixmap.isNull():
+            scaled = self._pixmap.scaled(
+                self.width() - 40, self.height() - 40,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            x = (self.width()  - scaled.width())  // 2
+            y = (self.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        self.hide()
+        self.dismissed.emit()
+
+
+# ============================================================================
 # Drop Zone widget
 # ============================================================================
 
@@ -465,6 +847,7 @@ class RotobotWindow(QMainWindow):
         self.resize(1000, 750)
 
         self._files = []
+        self._calibration_index = 0
         self._worker = None
         self._output_dir = ""
         self._is_video_mode = False
@@ -555,6 +938,11 @@ class RotobotWindow(QMainWindow):
         log.info("Rotobot GUI closed")
         super().closeEvent(event)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_fs_overlay'):
+            self._fs_overlay.setGeometry(self.centralWidget().rect())
+
     def _setup_palette(self):
         """Dark theme palette."""
         palette = QPalette()
@@ -588,12 +976,22 @@ class RotobotWindow(QMainWindow):
         subtitle.setStyleSheet("color: #888; font-size: 12px; margin-bottom: 10px;")
         layout.addWidget(subtitle)
 
-        # --- Drop Zone ---
+        # --- Top Section (Preview + Drop Zone) ---
+        top_layout = QHBoxLayout()
+        top_layout.setSpacing(15)
+
+        # Input Preview
+        self._input_preview = MediaPreviewWidget()
+        self._input_preview.next_clicked.connect(self._next_calibration_file)
+        self._input_preview.fullscreen_requested.connect(self._show_fullscreen)
+        top_layout.addWidget(self._input_preview, stretch=3)
+
+        # Drop Zone & Browse Buttons
+        drop_layout = QVBoxLayout()
         self._drop_zone = DropZone()
         self._drop_zone.files_dropped.connect(self._on_files_dropped)
-        layout.addWidget(self._drop_zone)
+        drop_layout.addWidget(self._drop_zone)
 
-        # --- Browse button ---
         browse_layout = QHBoxLayout()
         browse_btn = QPushButton("📂 Browse Files...")
         browse_btn.setStyleSheet(self._button_style("#2a2a4a", "#3a3a6a"))
@@ -604,7 +1002,20 @@ class RotobotWindow(QMainWindow):
         browse_folder_btn.setStyleSheet(self._button_style("#2a2a4a", "#3a3a6a"))
         browse_folder_btn.clicked.connect(self._browse_folder)
         browse_layout.addWidget(browse_folder_btn)
-        layout.addLayout(browse_layout)
+        
+        drop_layout.addLayout(browse_layout)
+        top_layout.addLayout(drop_layout, stretch=1)
+
+        layout.addLayout(top_layout)
+
+        # Calibration Mode Checkbox near browse
+        calib_layout = QHBoxLayout()
+        self._calib_check = QCheckBox("Calibration Mode")
+        self._calib_check.setToolTip("Process one file at a time, allowing you to tweak settings between images in a batch.")
+        self._calib_check.toggled.connect(self._on_calib_toggled)
+        calib_layout.addWidget(self._calib_check)
+        calib_layout.addStretch()
+        layout.addLayout(calib_layout)
 
         # --- Settings ---
         settings_group = QGroupBox("Settings")
@@ -919,9 +1330,9 @@ class RotobotWindow(QMainWindow):
         self._progress_bar.setVisible(False)
         layout.addWidget(self._progress_bar)
 
-        # --- Preview ---
-        self._preview = PreviewPanel()
-        layout.addWidget(self._preview, stretch=1)
+        # --- Fullscreen Overlay (hidden until triggered) ---
+        self._fs_overlay = FullscreenOverlay(central)
+        self._fs_overlay.setGeometry(central.rect())
 
         # --- Log ---
         self._log = QTextEdit()
@@ -1022,9 +1433,28 @@ class RotobotWindow(QMainWindow):
         if folder:
             self._output_edit.setText(folder)
 
+    def _on_calib_toggled(self, checked: bool):
+        self._input_preview.set_calibration_mode(checked)
+        if self._files:
+            # Maybe rename process button or update logic
+            pass
+
+    def _next_calibration_file(self):
+        if not self._files: return
+        self._calibration_index = (self._calibration_index + 1) % len(self._files)
+        self._show_current_input()
+
+    def _show_current_input(self):
+        if self._files and 0 <= self._calibration_index < len(self._files):
+            fpath = self._files[self._calibration_index]
+            self._input_preview.load_media(fpath)
+
     def _on_files_dropped(self, files: list):
         self._files = files
+        self._calibration_index = 0
         self._process_btn.setEnabled(True)
+
+        self._show_current_input()
 
         # Detect video mode
         n_vid = sum(1 for f in files if os.path.splitext(f)[1].lower() in VIDEO_EXTS)
@@ -1089,12 +1519,19 @@ class RotobotWindow(QMainWindow):
         kc = self._key_color
         key_color_rgb = (kc.red(), kc.green(), kc.blue())
 
+        # File targets
+        target_files = self._files
+        if self._calib_check.isChecked() and self._files:
+            # Find the currently selected file and only process it
+            if 0 <= self._calibration_index < len(self._files):
+                target_files = [self._files[self._calibration_index]]
+
         # --- Video mode ---
         if self._is_video_mode:
-            video_files = [f for f in self._files
+            video_files = [f for f in target_files
                            if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
             if not video_files:
-                self._log_msg("No video files found")
+                self._log_msg("No video files to process")
                 self._process_btn.setEnabled(True)
                 self._progress_bar.setVisible(False)
                 return
@@ -1141,10 +1578,10 @@ class RotobotWindow(QMainWindow):
             return
 
         # --- Image mode ---
-        self._progress_bar.setRange(0, len(self._files))
+        self._progress_bar.setRange(0, len(target_files))
         self._progress_bar.setValue(0)
-        self._log_msg("Processing %d images..." % len(self._files))
-        log.info("Processing started: %d images, output=%s", len(self._files), out_dir)
+        self._log_msg("Processing %d images..." % len(target_files))
+        log.info("Processing started: %d images, output=%s", len(target_files), out_dir)
 
         # Get output options
         crop = self._crop_check.isChecked()
@@ -1158,9 +1595,9 @@ class RotobotWindow(QMainWindow):
         # --- Auto-Inventory mode ---
         if self._inventory_check.isChecked():
             self._log_msg("Starting Auto-Inventory (SAM2)...")
-            self._progress_bar.setRange(0, len(self._files))
+            self._progress_bar.setRange(0, len(target_files))
             self._worker = InventoryWorker(
-                files=self._files,
+                files=target_files,
                 output_dir=out_dir,
                 box_thresh=self._thresh_slider.value() / 100.0,
                 text_thresh=0.20,
@@ -1179,7 +1616,7 @@ class RotobotWindow(QMainWindow):
 
         # --- Standard / Color Key mode ---
         self._worker = ProcessWorker(
-            files=self._files,
+            files=target_files,
             prompt=self._prompt_edit.text(),
             box_thresh=self._thresh_slider.value() / 100.0,
             text_thresh=0.20,
@@ -1204,11 +1641,19 @@ class RotobotWindow(QMainWindow):
 
     def _on_file_done(self, filename: str, alpha):
         if alpha is not None:
-            # Show the last completed file in preview
+            # Route result to the input preview widget
             for f in self._files:
                 if os.path.basename(f) == filename:
-                    self._preview.show_result(f, alpha)
+                    self._input_preview.set_alpha_result(f, alpha)
                     break
+
+    def _show_fullscreen(self):
+        """Show the current preview pixmap in a fullscreen overlay."""
+        pm = self._input_preview.get_current_pixmap()
+        if pm and not pm.isNull():
+            central = self.centralWidget()
+            self._fs_overlay.setGeometry(central.rect())
+            self._fs_overlay.show_pixmap(pm)
 
     def _on_finished(self, success: int, failed: int, elapsed: float):
         self._progress_bar.setVisible(False)
@@ -1223,9 +1668,15 @@ class RotobotWindow(QMainWindow):
     def _on_colorkey_toggled(self, checked: bool):
         """Enable/disable color key controls."""
         self._color_btn.setEnabled(checked)
-        # Dim the AI prompt controls when color keying is active
-        self._prompt_edit.setEnabled(not checked)
-        self._thresh_slider.setEnabled(not checked)
+        # Dim the AI prompt controls when color keying is active,
+        # but only re-enable prompt if inventory mode is also off.
+        if checked:
+            self._prompt_edit.setEnabled(False)
+            self._thresh_slider.setEnabled(False)
+        else:
+            if not self._inventory_check.isChecked():
+                self._prompt_edit.setEnabled(True)
+            self._thresh_slider.setEnabled(True)
 
     def _pick_key_color(self):
         """Open color picker dialog."""
@@ -1293,6 +1744,15 @@ class RotobotWindow(QMainWindow):
 # ============================================================================
 
 def main():
+    # Global exception hook so unhandled exceptions are logged
+    # instead of silently crashing the GUI to desktop.
+    def _exception_hook(exc_type, exc_value, exc_tb):
+        import traceback
+        log.error("Unhandled exception: %s", exc_value)
+        log.error("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _exception_hook
+
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
     app.setStyle("Fusion")

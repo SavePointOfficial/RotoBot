@@ -8,6 +8,7 @@ Pillow
 opencv-python
 tqdm
 PyQt6
+transformers<5.0    # GroundingDINO's BertModelWarper needs get_head_mask (removed in v5)
 
 # GroundingDINO and SAM2 are loaded from the parent project's models/ directory.
 # They do not need pip install — they are used via local imports.

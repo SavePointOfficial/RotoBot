@@ -1,4 +1,4 @@
 {
-    "sandbox_root": "D:\\PROGRAMS\\LabyrinthGameSandbox",
-    "_comment": "Path to the LabyrinthGameSandbox for models and dependencies. Edit this if the sandbox moves."
+    "sandbox_root": ".",
+    "_comment": "Path to the root directory containing models/. Use '.' for portable installs (relative to Rotobot dir)."
 }

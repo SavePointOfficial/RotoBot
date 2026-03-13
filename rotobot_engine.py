@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 ROTOBOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _resolve_sandbox_root():
-    """Find the LabyrinthGameSandbox root directory."""
+    """Find the root directory containing models/ (supports portable installs)."""
     import json as _json
 
     # 1. Check for config.json in the Rotobot directory
@@ -29,8 +29,12 @@ def _resolve_sandbox_root():
             with open(config_path, 'r') as f:
                 cfg = _json.load(f)
             root = cfg.get('sandbox_root', '')
-            if root and os.path.isdir(root):
-                return root
+            if root:
+                # Support relative paths (e.g. "." for portable installs)
+                if not os.path.isabs(root):
+                    root = os.path.normpath(os.path.join(ROTOBOT_DIR, root))
+                if os.path.isdir(root):
+                    return root
         except Exception:
             pass
 
@@ -39,8 +43,8 @@ def _resolve_sandbox_root():
     if env_root and os.path.isdir(env_root):
         return env_root
 
-    # 3. Fall back to parent directory (works when Rotobot/ is inside the sandbox)
-    return os.path.dirname(ROTOBOT_DIR)
+    # 3. Fall back to ROTOBOT_DIR itself (portable standalone install)
+    return ROTOBOT_DIR
 
 SANDBOX_ROOT = _resolve_sandbox_root()
 

@@ -214,6 +214,91 @@ class VideoWorker(QThread):
         self.finished.emit(frames_ok if ok else 0, 0 if ok else frames_ok, elapsed)
 
 
+class PreviewWorker(QThread):
+    """Processes a short excerpt of video frames through the roto engine for preview.
+
+    Emits raw engine alpha (no feather/invert applied) so the preview
+    widget can recomposite live when those settings change.
+    """
+    progress = pyqtSignal(int, int)             # current_frame, total_frames
+    frame_ready = pyqtSignal(object, object)    # frame_rgb (np.ndarray), alpha (np.ndarray)
+    finished = pyqtSignal(int, float)           # frames_processed, elapsed_seconds
+
+    def __init__(self, video_path, start_frame, frame_count,
+                 prompt, box_thresh, text_thresh, refine,
+                 color_key=False, key_color=(0, 0, 0), key_tolerance=30.0):
+        super().__init__()
+        self.video_path = video_path
+        self.start_frame = start_frame
+        self.frame_count = frame_count
+        self.prompt = prompt
+        self.box_thresh = box_thresh
+        self.text_thresh = text_thresh
+        self.refine = refine
+        self.color_key = color_key
+        self.key_color = key_color
+        self.key_tolerance = key_tolerance
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        import cv2
+        from rotobot_engine import RotobotEngine
+
+        engine = RotobotEngine.get_instance()
+        t0 = time.perf_counter()
+
+        # Load models if not color-key mode
+        if not self.color_key:
+            engine.ensure_models()
+
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            self.finished.emit(0, 0.0)
+            return
+
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+
+        count = min(self.frame_count, total - self.start_frame)
+        processed = 0
+
+        for i in range(count):
+            if self._cancel:
+                break
+
+            ret, bgr = cap.read()
+            if not ret:
+                break
+
+            frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            # Run engine with invert=False — post-processing applied during composite
+            if self.color_key:
+                alpha = engine.extract_alpha_from_color_array(
+                    frame_rgb, self.key_color, self.key_tolerance,
+                    self.refine, invert=False)
+            else:
+                alpha = engine.extract_alpha_from_array(
+                    frame_rgb, self.prompt, self.box_thresh,
+                    self.text_thresh, self.refine, invert=False)
+
+            if alpha is None:
+                alpha = np.zeros((h, w), dtype=np.uint8)
+
+            self.progress.emit(i + 1, count)
+            self.frame_ready.emit(frame_rgb, alpha)
+            processed += 1
+
+        cap.release()
+        elapsed = time.perf_counter() - t0
+        self.finished.emit(processed, elapsed)
+
+
 class InventoryWorker(QThread):
     """Runs SAM2 automatic segmentation to extract all visual elements."""
     progress = pyqtSignal(int, int, str)       # current, total, status_text
@@ -322,6 +407,7 @@ class MediaPreviewWidget(QFrame):
     """Shows the current input media with 3 display modes and fullscreen."""
     next_clicked = pyqtSignal()
     fullscreen_requested = pyqtSignal()   # ask main window for overlay
+    preview_requested = pyqtSignal()      # ask main window to run roto on excerpt
 
     def __init__(self):
         super().__init__()
@@ -343,6 +429,24 @@ class MediaPreviewWidget(QFrame):
         self._cap = None
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_frame)
+        self._total_frames = 0         # total frames in loaded video
+        self._video_fps = 30.0         # fps of loaded video
+
+        # Excerpt playback state
+        self._excerpt_active = False
+        self._excerpt_frames_shown = 0
+        self._preview_frames = []      # list of QPixmap for processed preview
+        self._preview_raw = []         # list of (frame_rgb, raw_alpha) np arrays
+        self._preview_index = 0        # current frame in preview loop
+        self._preview_processing = False  # True while PreviewWorker is running
+
+        # Debounce timer for live recomposite
+        self._recomp_timer = QTimer()
+        self._recomp_timer.setSingleShot(True)
+        self._recomp_timer.setInterval(250)
+        self._recomp_timer.timeout.connect(self._do_recomposite)
+        self._recomp_feather = 0
+        self._recomp_invert = False
 
         # Layout --------------------------------------------------------
         root = QVBoxLayout(self)
@@ -418,10 +522,83 @@ class MediaPreviewWidget(QFrame):
         bottom_bar.addWidget(self._next_btn)
         root.addLayout(bottom_bar)
 
+        # -- Excerpt preview controls (visible only for videos) ----------
+        _SPIN_SS = (
+            "QSpinBox { background: #1a1a2e; border: 1px solid #444; "
+            "border-radius: 4px; padding: 3px; color: #ddd; font-size: 12px; }"
+        )
+        excerpt_bar = QHBoxLayout()
+        excerpt_bar.setContentsMargins(10, 0, 10, 8)
+
+        self._excerpt_btn = QPushButton("▶ Roto Preview")
+        self._excerpt_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._excerpt_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a3a1a;
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 5px 12px;
+                color: #6f6;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #2a5a2a; border-color: #6f6; }
+        """)
+        self._excerpt_btn.setToolTip(
+            "Process this frame range through the roto engine\n"
+            "and loop the result for quality checking")
+        self._excerpt_btn.clicked.connect(self._toggle_excerpt)
+        excerpt_bar.addWidget(self._excerpt_btn)
+
+        excerpt_bar.addSpacing(10)
+        lbl_start = QLabel("Start:")
+        lbl_start.setStyleSheet("color: #aaa; font-size: 11px; border: none;")
+        excerpt_bar.addWidget(lbl_start)
+        self._excerpt_start_spin = QSpinBox()
+        self._excerpt_start_spin.setRange(0, 0)
+        self._excerpt_start_spin.setValue(0)
+        self._excerpt_start_spin.setFixedWidth(70)
+        self._excerpt_start_spin.setStyleSheet(_SPIN_SS)
+        self._excerpt_start_spin.setToolTip("Start frame for the excerpt")
+        excerpt_bar.addWidget(self._excerpt_start_spin)
+
+        excerpt_bar.addSpacing(10)
+        lbl_count = QLabel("Frames:")
+        lbl_count.setStyleSheet("color: #aaa; font-size: 11px; border: none;")
+        excerpt_bar.addWidget(lbl_count)
+        self._excerpt_count_spin = QSpinBox()
+        self._excerpt_count_spin.setRange(1, 9999)
+        self._excerpt_count_spin.setValue(30)
+        self._excerpt_count_spin.setFixedWidth(70)
+        self._excerpt_count_spin.setStyleSheet(_SPIN_SS)
+        self._excerpt_count_spin.setToolTip("Number of frames to preview")
+        excerpt_bar.addWidget(self._excerpt_count_spin)
+
+        excerpt_bar.addStretch()
+
+        # Wrap in a widget so we can show/hide the entire row
+        self._excerpt_row = QWidget()
+        self._excerpt_row.setLayout(excerpt_bar)
+        self._excerpt_row.setStyleSheet("background: transparent; border: none;")
+        self._excerpt_row.setVisible(False)
+        root.addWidget(self._excerpt_row)
+
+        # -- Status bar (frame counter / processing progress) -----------
+        self._status_label = QLabel("")
+        self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_label.setFixedHeight(20)
+        self._status_label.setStyleSheet(
+            "color: #888; font-size: 11px; font-family: Consolas; "
+            "background: transparent; border: none; padding: 0 8px;")
+        root.addWidget(self._status_label)
+
     # -- public API ----------------------------------------------------
 
     def set_calibration_mode(self, enabled: bool):
         self._next_btn.setVisible(enabled)
+
+    def set_status(self, text: str):
+        """Set the status bar text (called externally for processing progress)."""
+        self._status_label.setText(text)
 
     def load_media(self, path: str):
         """Load a new file into the preview (resets alpha result)."""
@@ -436,12 +613,26 @@ class MediaPreviewWidget(QFrame):
         if not path:
             self._label.clear()
             self._label.setText("No Input")
+            self._excerpt_row.setVisible(False)
             return
 
         ext = os.path.splitext(path)[1].lower()
         if ext in VIDEO_EXTS:
             self._play_video(path)
+            # Show excerpt controls and set ranges from video metadata
+            self._excerpt_row.setVisible(True)
+            if self._cap and self._cap.isOpened():
+                import cv2
+                self._total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self._video_fps = self._cap.get(cv2.CAP_PROP_FPS)
+                if self._video_fps <= 0:
+                    self._video_fps = 30.0
+                if self._total_frames > 0:
+                    self._excerpt_start_spin.setRange(0, max(self._total_frames - 1, 0))
+                    self._excerpt_count_spin.setRange(1, self._total_frames)
         else:
+            self._excerpt_row.setVisible(False)
+            self._total_frames = 0
             pixmap = QPixmap(path)
             if not pixmap.isNull():
                 self._original_pixmap = pixmap
@@ -601,13 +792,31 @@ class MediaPreviewWidget(QFrame):
         self._timer.start(int(1000.0 / fps))
 
     def _update_frame(self):
+        # -- Processed preview loop (pre-rendered QPixmaps) --
+        if self._excerpt_active and self._preview_frames:
+            pm = self._preview_frames[self._preview_index]
+            self._label.setPixmap(pm)
+            self._status_label.setText(
+                "Preview  ▶  Frame %d / %d" % (
+                    self._preview_index + 1, len(self._preview_frames)))
+            self._preview_index = (self._preview_index + 1) % len(self._preview_frames)
+            return
+
+        # -- Raw video playback --
         if not self._cap: return
+        import cv2
         ret, frame = self._cap.read()
         if not ret:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, frame = self._cap.read()
             if not ret: return
-        import cv2
+
+        # Update status with current frame position
+        cur_frame = int(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
+        if self._total_frames > 0:
+            self._status_label.setText(
+                "Frame %d / %d" % (cur_frame, self._total_frames))
+
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         qimg = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
@@ -618,8 +827,221 @@ class MediaPreviewWidget(QFrame):
             Qt.TransformationMode.FastTransformation)
         self._label.setPixmap(scaled)
 
+    def _toggle_excerpt(self):
+        """Start or stop roto preview."""
+        if self._excerpt_active:
+            self._stop_excerpt()
+        elif self._preview_processing:
+            # Cancel in-progress preview
+            self._stop_excerpt()
+        else:
+            self._start_excerpt()
+
+    def _start_excerpt(self):
+        """Request the main window to run roto on the excerpt frames."""
+        if not self._current_media:
+            return
+
+        # Stop current video playback
+        self._stop_video()
+
+        # Clear old preview
+        self._preview_frames = []
+        self._preview_raw = []
+        self._preview_index = 0
+        self._preview_processing = True
+
+        self._excerpt_btn.setText("■ Cancel")
+        self._excerpt_btn.setStyleSheet("""
+            QPushButton {
+                background: #3a1a1a;
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 5px 12px;
+                color: #f66;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #5a2a2a; border-color: #f66; }
+        """)
+        self._excerpt_start_spin.setEnabled(False)
+        self._excerpt_count_spin.setEnabled(False)
+        self._status_label.setText("Processing preview...")
+
+        # Signal main window to spawn the PreviewWorker
+        self.preview_requested.emit()
+
+    def on_preview_frame(self, frame_rgb: np.ndarray, alpha: np.ndarray):
+        """Called by main window when a preview frame is processed.
+
+        Stores raw data for live recomposite and builds initial display.
+        """
+        # Store raw for live recomposite (copies to avoid thread issues)
+        self._preview_raw.append((frame_rgb.copy(), alpha.copy()))
+
+        # Build display pixmap with current feather/invert
+        pm = self._composite_frame(frame_rgb, alpha,
+                                   self._recomp_feather, self._recomp_invert)
+        self._preview_frames.append(pm)
+        # Show each frame as it arrives
+        self._label.setPixmap(pm)
+
+    def on_preview_progress(self, current: int, total: int):
+        """Update status during preview processing."""
+        self._status_label.setText(
+            "Roto Preview  ▶  Frame %d / %d" % (current, total))
+
+    def on_preview_done(self, count: int, elapsed: float):
+        """Called when PreviewWorker finishes. Start looping the results."""
+        self._preview_processing = False
+        self._excerpt_start_spin.setEnabled(True)
+        self._excerpt_count_spin.setEnabled(True)
+
+        if not self._preview_frames:
+            self._status_label.setText("Preview: no frames processed")
+            self._reset_excerpt_btn()
+            # Resume raw video playback
+            path = self._current_media
+            if path and os.path.splitext(path)[1].lower() in VIDEO_EXTS:
+                self._play_video(path)
+            return
+
+        self._status_label.setText(
+            "✔ Preview ready — %d frames in %.1fs  (looping)" % (count, elapsed))
+
+        # Start looping the processed frames
+        self._excerpt_active = True
+        self._preview_index = 0
+        self._excerpt_btn.setText("■ Stop")
+        self._excerpt_btn.setStyleSheet("""
+            QPushButton {
+                background: #3a1a1a;
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 5px 12px;
+                color: #f66;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #5a2a2a; border-color: #f66; }
+        """)
+        self._timer.start(int(1000.0 / self._video_fps))
+
+    def _stop_excerpt(self):
+        """Stop roto preview playback and resume full video loop."""
+        self._timer.stop()
+        self._recomp_timer.stop()
+        self._excerpt_active = False
+        self._preview_processing = False
+        self._preview_frames = []
+        self._preview_raw = []
+        self._preview_index = 0
+        self._excerpt_start_spin.setEnabled(True)
+        self._excerpt_count_spin.setEnabled(True)
+        self._reset_excerpt_btn()
+        # Restart full video playback
+        path = self._current_media
+        if path and os.path.splitext(path)[1].lower() in VIDEO_EXTS:
+            self._play_video(path)
+
+    def _reset_excerpt_btn(self):
+        self._excerpt_btn.setText("▶ Roto Preview")
+        self._excerpt_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a3a1a;
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 5px 12px;
+                color: #6f6;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #2a5a2a; border-color: #6f6; }
+        """)
+
+    # -- live recomposite ----------------------------------------------
+
+    def schedule_recomposite(self, feather: int, invert: bool):
+        """Called by the main window when feather/invert settings change.
+
+        Debounces at 250 ms so dragging a slider doesn't cause stutter.
+        """
+        if not self._preview_raw:
+            return   # no preview data to recomposite
+        self._recomp_feather = feather
+        self._recomp_invert = invert
+        self._recomp_timer.start()   # (re)starts the 250 ms countdown
+
+    def _do_recomposite(self):
+        """Rebuild all preview QPixmaps from stored raw data with new settings."""
+        if not self._preview_raw:
+            return
+
+        new_frames = []
+        for frame_rgb, raw_alpha in self._preview_raw:
+            pm = self._composite_frame(frame_rgb, raw_alpha,
+                                       self._recomp_feather,
+                                       self._recomp_invert)
+            new_frames.append(pm)
+
+        self._preview_frames = new_frames
+        # Clamp index in case frame count somehow changed
+        if self._preview_index >= len(self._preview_frames):
+            self._preview_index = 0
+
+        feather_txt = "%dpx" % self._recomp_feather if self._recomp_feather else "off"
+        invert_txt = "inv" if self._recomp_invert else ""
+        self._status_label.setText(
+            "▶ Preview  —  %d frames  (feather %s%s)" % (
+                len(self._preview_frames), feather_txt,
+                ", " + invert_txt if invert_txt else ""))
+
+    @staticmethod
+    def _composite_frame(frame_rgb, alpha, feather, invert):
+        """Build a single checkerboard-composited QPixmap from raw data."""
+        from PIL import Image
+        import cv2
+
+        h, w = frame_rgb.shape[:2]
+        a = alpha.copy()
+
+        # Apply feather
+        if feather > 0:
+            k = feather * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            dilated = cv2.dilate(a, kernel)
+            eroded = cv2.erode(a, kernel)
+            edge_zone = (dilated > 0) & (eroded < 255)
+            blurred = cv2.GaussianBlur(a, (k, k), feather * 0.5)
+            a = np.where(edge_zone, blurred, a)
+
+        # Apply invert
+        if invert:
+            a = 255 - a
+
+        # Scale for preview
+        # (use moderate max size to keep composite fast)
+        max_w = min(w, 960)
+        max_h = min(h, 540)
+        scale = min(max_w / w, max_h / h, 1.0)
+        pw = max(int(w * scale), 1)
+        ph = max(int(h * scale), 1)
+
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[:, :, :3] = frame_rgb
+        rgba[:, :, 3] = a
+        rgba_img = Image.fromarray(rgba, 'RGBA').resize((pw, ph), Image.LANCZOS)
+
+        checker = _make_checker(pw, ph, 8)
+        bg = Image.fromarray(checker).convert('RGBA')
+        bg.paste(rgba_img, (0, 0), rgba_img)
+        result = bg.convert('RGB')
+
+        arr = np.array(result)
+        qimg = QImage(arr.data, pw, ph, pw * 3, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
+
     def _stop_video(self):
         self._timer.stop()
+        self._excerpt_active = False
+        self._excerpt_frames_shown = 0
         if self._cap:
             self._cap.release()
             self._cap = None
@@ -849,9 +1271,18 @@ class RotobotWindow(QMainWindow):
         self._files = []
         self._calibration_index = 0
         self._worker = None
+        self._preview_worker = None
         self._output_dir = ""
         self._is_video_mode = False
+        self._pending_videos = []      # queue of video paths remaining
+        self._video_stats = {'success': 0, 'failed': 0, 'elapsed': 0.0, 'total': 0}
         self._settings = QSettings("Rotobot", "RotobotGUI")
+
+        # Debounce timer for auto-restarting preview on engine settings changes
+        self._preview_restart_timer = QTimer()
+        self._preview_restart_timer.setSingleShot(True)
+        self._preview_restart_timer.setInterval(500)
+        self._preview_restart_timer.timeout.connect(self._do_preview_restart)
 
         self._setup_palette()
         self._build_ui()
@@ -984,6 +1415,7 @@ class RotobotWindow(QMainWindow):
         self._input_preview = MediaPreviewWidget()
         self._input_preview.next_clicked.connect(self._next_calibration_file)
         self._input_preview.fullscreen_requested.connect(self._show_fullscreen)
+        self._input_preview.preview_requested.connect(self._start_roto_preview)
         top_layout.addWidget(self._input_preview, stretch=3)
 
         # Drop Zone & Browse Buttons
@@ -1059,6 +1491,7 @@ class RotobotWindow(QMainWindow):
         self._thresh_label = QLabel("0.25")
         self._thresh_slider.valueChanged.connect(
             lambda v: self._thresh_label.setText("%.2f" % (v / 100.0)))
+        self._thresh_slider.valueChanged.connect(self._on_engine_setting_changed)
         controls_row.addWidget(self._thresh_slider)
         controls_row.addWidget(self._thresh_label)
 
@@ -1071,11 +1504,13 @@ class RotobotWindow(QMainWindow):
         self._refine_combo.setStyleSheet(
             "background: #1a1a2e; border: 1px solid #444; border-radius: 4px; "
             "padding: 3px; color: #ddd;")
+        self._refine_combo.currentIndexChanged.connect(self._on_engine_setting_changed)
         controls_row.addWidget(self._refine_combo)
 
         controls_row.addSpacing(20)
 
         self._invert_check = QCheckBox("Invert Alpha")
+        self._invert_check.toggled.connect(self._on_preview_setting_changed)
         controls_row.addWidget(self._invert_check)
 
         controls_row.addSpacing(20)
@@ -1089,6 +1524,7 @@ class RotobotWindow(QMainWindow):
         self._feather_label = QLabel("0 px")
         self._feather_slider.valueChanged.connect(
             lambda v: self._feather_label.setText("%d px" % v))
+        self._feather_slider.valueChanged.connect(self._on_preview_setting_changed)
         controls_row.addWidget(self._feather_slider)
         controls_row.addWidget(self._feather_label)
 
@@ -1155,6 +1591,7 @@ class RotobotWindow(QMainWindow):
         self._tolerance_label = QLabel("30")
         self._tolerance_slider.valueChanged.connect(
             lambda v: self._tolerance_label.setText(str(v)))
+        self._tolerance_slider.valueChanged.connect(self._on_engine_setting_changed)
         tolerance_row.addWidget(self._tolerance_slider)
         tolerance_row.addWidget(self._tolerance_label)
         tolerance_row.addStretch()
@@ -1536,45 +1973,13 @@ class RotobotWindow(QMainWindow):
                 self._progress_bar.setVisible(False)
                 return
 
-            # Process first video file
-            vid_path = video_files[0]
-            from rotobot_engine import RotobotEngine
-            info = RotobotEngine.get_video_info(vid_path)
-
-            self._progress_bar.setRange(0, info['frames'])
-            self._progress_bar.setValue(0)
-            self._log_msg("Processing video: %s (%d frames)..." % (
-                os.path.basename(vid_path), info['frames']))
-            log.info("Video processing started: %s, %d frames", vid_path, info['frames'])
-
-            # Determine output format and path
-            fmt_idx = self._video_format_combo.currentIndex()
-            if fmt_idx == 1:  # PNG Sequence
-                vid_format = 'png_seq'
-                stem = os.path.splitext(os.path.basename(vid_path))[0]
-                out_path = os.path.join(out_dir, stem + "_alpha_frames")
-            else:  # WebM
-                vid_format = 'webm'
-                stem = os.path.splitext(os.path.basename(vid_path))[0]
-                out_path = os.path.join(out_dir, stem + "_alpha.webm")
-
-            self._worker = VideoWorker(
-                video_path=vid_path,
-                prompt=self._prompt_edit.text(),
-                box_thresh=self._thresh_slider.value() / 100.0,
-                text_thresh=0.20,
-                refine=self._refine_combo.currentIndex(),
-                invert=self._invert_check.isChecked(),
-                output_path=out_path,
-                output_format=vid_format,
-                color_key=use_color_key,
-                key_color=key_color_rgb,
-                key_tolerance=float(self._tolerance_slider.value()),
-                feather=feather,
-            )
-            self._worker.progress.connect(self._on_progress)
-            self._worker.finished.connect(self._on_finished)
-            self._worker.start()
+            # Queue all videos for sequential processing
+            self._pending_videos = list(video_files)
+            self._video_stats = {
+                'success': 0, 'failed': 0, 'elapsed': 0.0,
+                'total': len(video_files),
+            }
+            self._start_next_video(out_dir, use_color_key, key_color_rgb, feather)
             return
 
         # --- Image mode ---
@@ -1638,6 +2043,12 @@ class RotobotWindow(QMainWindow):
     def _on_progress(self, current: int, total: int, filename: str):
         self._progress_bar.setValue(current)
         self._log_msg("[%d/%d] %s" % (current, total, filename))
+        if self._is_video_mode:
+            self._input_preview.set_status(
+                "Processing  ▶  Frame %d / %d" % (current, total))
+        else:
+            self._input_preview.set_status(
+                "Processing  ▶  %d / %d images" % (current, total))
 
     def _on_file_done(self, filename: str, alpha):
         if alpha is not None:
@@ -1647,6 +2058,95 @@ class RotobotWindow(QMainWindow):
                     self._input_preview.set_alpha_result(f, alpha)
                     break
 
+    def _start_roto_preview(self):
+        """Spawn a PreviewWorker to process the selected excerpt frames."""
+        if not self._files or not self._is_video_mode:
+            return
+
+        # Cancel any existing preview worker
+        if self._preview_worker and self._preview_worker.isRunning():
+            self._preview_worker.cancel()
+            self._preview_worker.wait(2000)
+
+        vid_files = [f for f in self._files
+                     if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
+        if not vid_files:
+            return
+
+        vid_path = vid_files[0]
+        preview = self._input_preview
+        start_frame = preview._excerpt_start_spin.value()
+        frame_count = preview._excerpt_count_spin.value()
+
+        # Pass current feather/invert so initial composite uses them
+        preview._recomp_feather = self._feather_slider.value()
+        preview._recomp_invert = self._invert_check.isChecked()
+
+        use_color_key = self._colorkey_check.isChecked()
+        kc = self._key_color
+        key_color_rgb = (kc.red(), kc.green(), kc.blue())
+
+        # PreviewWorker runs WITHOUT feather/invert — those are applied
+        # during compositing so they can be changed live.
+        self._preview_worker = PreviewWorker(
+            video_path=vid_path,
+            start_frame=start_frame,
+            frame_count=frame_count,
+            prompt=self._prompt_edit.text(),
+            box_thresh=self._thresh_slider.value() / 100.0,
+            text_thresh=0.20,
+            refine=self._refine_combo.currentIndex(),
+            color_key=use_color_key,
+            key_color=key_color_rgb,
+            key_tolerance=float(self._tolerance_slider.value()),
+        )
+        self._preview_worker.progress.connect(preview.on_preview_progress)
+        self._preview_worker.frame_ready.connect(preview.on_preview_frame)
+        self._preview_worker.finished.connect(preview.on_preview_done)
+        self._preview_worker.start()
+
+        self._log_msg("Roto preview started: frames %d–%d from %s" % (
+            start_frame, start_frame + frame_count - 1,
+            os.path.basename(vid_path)))
+
+    def _on_preview_setting_changed(self, *args):
+        """Feather or invert changed — live-update the roto preview if active."""
+        self._input_preview.schedule_recomposite(
+            feather=self._feather_slider.value(),
+            invert=self._invert_check.isChecked(),
+        )
+
+    def _on_engine_setting_changed(self, *args):
+        """Engine-level setting changed (threshold, refine, tolerance).
+
+        Auto-restart the roto preview with new settings (debounced 500ms).
+        """
+        preview = self._input_preview
+        if preview._preview_raw or preview._preview_processing:
+            self._preview_restart_timer.start()
+
+    def _do_preview_restart(self):
+        """Debounced: cancel current preview and restart with new settings."""
+        preview = self._input_preview
+        if not preview._current_media:
+            return
+
+        # Cancel existing worker
+        if self._preview_worker and self._preview_worker.isRunning():
+            self._preview_worker.cancel()
+            self._preview_worker.wait(2000)
+
+        # Reset preview state but keep excerpt controls as-is
+        preview._timer.stop()
+        preview._excerpt_active = False
+        preview._preview_processing = False
+        preview._preview_frames = []
+        preview._preview_raw = []
+        preview._preview_index = 0
+
+        # Re-trigger the preview
+        preview._start_excerpt()
+
     def _show_fullscreen(self):
         """Show the current preview pixmap in a fullscreen overlay."""
         pm = self._input_preview.get_current_pixmap()
@@ -1655,7 +2155,92 @@ class RotobotWindow(QMainWindow):
             self._fs_overlay.setGeometry(central.rect())
             self._fs_overlay.show_pixmap(pm)
 
+    def _start_next_video(self, out_dir, use_color_key, key_color_rgb, feather):
+        """Pop the next video from the pending queue and start processing it."""
+        if not self._pending_videos:
+            return
+
+        vid_path = self._pending_videos.pop(0)
+        vid_num = self._video_stats['total'] - len(self._pending_videos)
+
+        from rotobot_engine import RotobotEngine
+        info = RotobotEngine.get_video_info(vid_path)
+
+        self._progress_bar.setRange(0, info['frames'])
+        self._progress_bar.setValue(0)
+        self._log_msg("[%d/%d] Processing video: %s (%d frames)..." % (
+            vid_num, self._video_stats['total'],
+            os.path.basename(vid_path), info['frames']))
+        log.info("Video processing started: %s, %d frames", vid_path, info['frames'])
+
+        # Load this video into the preview
+        self._input_preview.load_media(vid_path)
+
+        # Determine output format and path
+        fmt_idx = self._video_format_combo.currentIndex()
+        if fmt_idx == 1:  # PNG Sequence
+            vid_format = 'png_seq'
+            stem = os.path.splitext(os.path.basename(vid_path))[0]
+            out_path = os.path.join(out_dir, stem + "_alpha_frames")
+        else:  # WebM
+            vid_format = 'webm'
+            stem = os.path.splitext(os.path.basename(vid_path))[0]
+            out_path = os.path.join(out_dir, stem + "_alpha.webm")
+
+        self._worker = VideoWorker(
+            video_path=vid_path,
+            prompt=self._prompt_edit.text(),
+            box_thresh=self._thresh_slider.value() / 100.0,
+            text_thresh=0.20,
+            refine=self._refine_combo.currentIndex(),
+            invert=self._invert_check.isChecked(),
+            output_path=out_path,
+            output_format=vid_format,
+            color_key=use_color_key,
+            key_color=key_color_rgb,
+            key_tolerance=float(self._tolerance_slider.value()),
+            feather=feather,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
     def _on_finished(self, success: int, failed: int, elapsed: float):
+        # --- Video queue: chain to next video if any remain ---
+        if self._is_video_mode and self._pending_videos:
+            stats = self._video_stats
+            stats['success'] += success
+            stats['failed'] += failed
+            stats['elapsed'] += elapsed
+
+            vid_num = stats['total'] - len(self._pending_videos)
+            self._log_msg("✔ Video %d/%d done (%d frames in %.1fs)" % (
+                vid_num, stats['total'], success, elapsed))
+
+            # Determine output dir (reuse from settings)
+            out_dir = self._output_edit.text().strip()
+            if not out_dir:
+                out_dir = os.path.dirname(self._files[0])
+
+            feather = self._feather_slider.value()
+            use_color_key = self._colorkey_check.isChecked()
+            kc = self._key_color
+            key_color_rgb = (kc.red(), kc.green(), kc.blue())
+
+            self._start_next_video(out_dir, use_color_key, key_color_rgb, feather)
+            return
+
+        # --- All done (image mode or last video) ---
+        if self._is_video_mode and self._video_stats['total'] > 1:
+            # Accumulate final video stats
+            stats = self._video_stats
+            stats['success'] += success
+            stats['failed'] += failed
+            stats['elapsed'] += elapsed
+            success = stats['success']
+            failed = stats['failed']
+            elapsed = stats['elapsed']
+
         self._progress_bar.setVisible(False)
         self._process_btn.setEnabled(True)
         self._log_msg("Done! %d/%d succeeded in %.1fs" % (
@@ -1664,6 +2249,8 @@ class RotobotWindow(QMainWindow):
             success, success + failed, elapsed)
         if failed:
             self._log_msg("%d files had no detections" % failed)
+        self._input_preview.set_status(
+            "✔ Done — %d/%d in %.1fs" % (success, success + failed, elapsed))
 
     def _on_colorkey_toggled(self, checked: bool):
         """Enable/disable color key controls."""

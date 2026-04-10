@@ -1,29 +1,25 @@
 @echo off
-REM Rotobot Standalone Launcher
-REM Activates the LabyrinthGameSandbox venv and runs the GUI.
+REM Rotobot Launcher
+REM Uses the embedded Python installed by install_rotobot.bat
 
 cd /d "%~dp0"
 
-REM 1. Priority: local venv created by install_rotobot.bat
-set VENV=%~dp0venv\Scripts\activate.bat
-if not exist "%VENV%" (
-    REM 2. Fallback: LabyrinthGameSandbox
-    set VENV=D:\PROGRAMS\LabyrinthGameSandbox\.venv\Scripts\activate.bat
-)
+set "PYTHON_EXE=%~dp0venv\Scripts\python.exe"
 
-if exist "%VENV%" (
-    call "%VENV%"
-) else (
-    echo WARNING: Virtual environment not found.
-    echo Trying system Python...
+if not exist "%PYTHON_EXE%" (
+    echo [ERROR] Python venv not found.
+    echo Please run install_rotobot.bat first.
+    echo.
+    pause
+    exit /b 1
 )
 
 echo ============================================================
-echo   ROTOBOT -- Automatic Rotoscoping Tool  (Standalone)
+echo   ROTOBOT -- Automatic Rotoscoping Tool
 echo ============================================================
 echo.
 
-python rotobot_gui.py
+"%PYTHON_EXE%" rotobot_gui.py
 
 if errorlevel 1 (
     echo.
